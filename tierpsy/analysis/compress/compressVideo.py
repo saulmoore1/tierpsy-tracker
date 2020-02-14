@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 """
 Created on Thu Apr  2 13:19:58 2015
-
 @author: ajaver
 """
 import os
@@ -27,7 +26,8 @@ def getROIMask(
         thresh_C,
         dilation_size,
         keep_border_data,
-        is_light_background):
+        is_light_background,
+        wells_mask=None):
     '''
     Calculate a binary mask to mark areas where it is possible to find worms.
     Objects with less than min_area or more than max_area pixels are rejected.
@@ -37,7 +37,8 @@ def getROIMask(
         > thresh_block_size -- block size used by openCV adaptiveThreshold
         > dilation_size -- size of the structure element to dilate the mask
         > keep_border_data -- (bool) if false it will reject any blob that touches the image border
-
+        > is_light_background -- (bool) true if bright field, false if fluorescence
+        > wells_mask -- (bool 2D) mask that covers (with False) the edges of wells in a MW plate
     '''
     # Objects that touch the limit of the image are removed. I use -2 because
     # openCV findCountours remove the border pixels
@@ -79,16 +80,22 @@ def getROIMask(
     contours, hierarchy = cv2.findContours(
         mask.copy(), cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)[-2:]
 
-
     # find good contours: between max_area and min_area, and do not touch the
     # image border
     goodIndex = []
     for ii, contour in enumerate(contours):
         if not keep_border_data:
-            # eliminate blobs that touch a border
-            keep = not np.any(contour == 1) and \
-                not np.any(contour[:, :, 0] ==  IM_LIMY)\
-                and not np.any(contour[:, :, 1] == IM_LIMX)
+            if wells_mask is None:
+                # eliminate blobs that touch a border
+                # TODO: double check this next line. I suspect contour is in
+                # x,y and not row columns
+                keep = not np.any(contour == 1) and \
+                    not np.any(contour[:, :, 0] ==  IM_LIMY)\
+                    and not np.any(contour[:, :, 1] == IM_LIMX)
+            else:
+                # keep if no pixel of contour is in the 0 part of the mask
+                keep = not np.any(wells_mask[contour[:, :, 1],
+                                             contour[:, :, 0]] == 0)
         else:
             keep = True
 
@@ -122,16 +129,16 @@ def normalizeImage(img):
     # normalise image intensities if the data type is other
     # than uint8
     image = image.astype(np.double)
-    
+
     imax = img.max()
     imin = img.min()
     factor = 255/(imax-imin)
-    
+
     imgN = ne.evaluate('(img-imin)*factor')
     imgN = imgN.astype(np.uint8)
 
     return imgN, (imin, imax)
- 
+
 def reduceBuffer(Ibuff, is_light_background):
     if is_light_background:
         return np.min(Ibuff, axis=0)
@@ -175,36 +182,36 @@ def createImgGroup(fid, name, tot_frames, im_height, im_width, is_expandable=Tru
 
     return img_dataset
 
-def initMasksGroups(fid, expected_frames, im_height, im_width, 
+def initMasksGroups(fid, expected_frames, im_height, im_width,
     attr_params, save_full_interval, is_expandable=True):
 
     # open node to store the compressed (masked) data
     mask_dataset = createImgGroup(fid, "/mask", expected_frames, im_height, im_width, is_expandable)
-    
+
 
     tot_save_full = (expected_frames // save_full_interval) + 1
     full_dataset = createImgGroup(fid, "/full_data", tot_save_full, im_height, im_width, is_expandable)
     full_dataset._v_attrs['save_interval'] = save_full_interval
-    
+
 
     assert all(x in ['expected_fps', 'is_light_background', 'microns_per_pixel'] for x in attr_params)
     set_unit_conversions(mask_dataset, **attr_params)
     set_unit_conversions(full_dataset, **attr_params)
 
     if is_expandable:
-        mean_intensity = fid.create_earray('/', 
+        mean_intensity = fid.create_earray('/',
                                         'mean_intensity',
                                         atom=tables.Float32Atom(),
                                         shape=(0,),
                                         expectedrows=expected_frames,
                                         filters=TABLE_FILTERS)
     else:
-        mean_intensity = fid.create_carray('/', 
+        mean_intensity = fid.create_carray('/',
                                         'mean_intensity',
                                         atom=tables.Float32Atom(),
                                         shape=(expected_frames,),
                                         filters=TABLE_FILTERS)
-    
+
     return mask_dataset, full_dataset, mean_intensity
 
 
@@ -230,13 +237,13 @@ def compressVideo(video_file, masked_image_file, mask_param,  expected_fps=25,
     '''
 
     #get the default values if there is any bad parameter
-    output = compress_defaults(masked_image_file, 
-                                expected_fps, 
-                                buffer_size = buffer_size, 
+    output = compress_defaults(masked_image_file,
+                                expected_fps,
+                                buffer_size = buffer_size,
                                 save_full_interval = save_full_interval)
 
-    buffer_size = output['buffer_size'] 
-    save_full_interval = output['save_full_interval'] 
+    buffer_size = output['buffer_size']
+    save_full_interval = output['save_full_interval']
 
     if len(bgnd_param) > 0:
         is_bgnd_subtraction = True
@@ -253,14 +260,14 @@ def compressVideo(video_file, masked_image_file, mask_param,  expected_fps=25,
 
     # processes identifier.
     base_name = masked_image_file.rpartition('.')[0].rpartition(os.sep)[-1]
-    
+
     # select the video reader class according to the file type.
     vid = selectVideoReader(video_file)
-    
+
     # delete any previous  if it existed
     with tables.File(masked_image_file, "w") as mask_fid:
         pass
-    
+
     #Extract metadata
     if is_extract_timestamp:
         # extract and store video metadata using ffprobe
@@ -270,7 +277,7 @@ def compressVideo(video_file, masked_image_file, mask_param,  expected_fps=25,
 
     else:
         expected_frames = 1
-    
+
     # Initialize background subtraction if required
 
     if is_bgnd_subtraction:
@@ -282,28 +289,30 @@ def compressVideo(video_file, masked_image_file, mask_param,  expected_fps=25,
     frame_number = 0
     full_frame_number = 0
     image_prev = np.zeros([])
-    
+
     # Initialise FOV splitting if needed
+    if is_bgnd_subtraction:
+        img_fov = bgnd_subtractor.bgnd.astype(np.uint8)
+    else:
+        ret, img_fov = vid.read()
+        # close and reopen the video, to restart from the beginning
+        vid.release()
+        vid = selectVideoReader(video_file)
+
     if is_fov_tosplit:
-        # masked video does not exist yet so have to initialise from data  
-        # use either background or first frame
-        if is_bgnd_subtraction:
-            img_fov = bgnd_subtractor.bgnd.astype(np.uint8)
-        else:
-            ret, img_fov = vid.read()
-            # close and reopen the video, to restart from the beginning
-            vid.release()
-            vid = selectVideoReader(video_file); 
-        # TODO: change class creator so it only needs the video name? by using 
+        # TODO: change class creator so it only needs the video name? by using
         # Tierpsy's functions such as selectVideoReader it can then read the first image by itself
-        
+
         camera_serial = parse_camera_serial(masked_image_file)
-        
+
         fovsplitter = FOVMultiWellsSplitter(img_fov,
                                             camera_serial=camera_serial,
                                             px2um=microns_per_pixel,
                                             **fovsplitter_param)
-        
+        wells_mask = fovsplitter.wells_mask
+    else:
+        wells_mask = None
+
 
 
     # initialize timers
@@ -325,26 +334,26 @@ def compressVideo(video_file, masked_image_file, mask_param,  expected_fps=25,
             microns_per_pixel = microns_per_pixel,
             is_light_background = int(mask_param['is_light_background'])
             )
-        mask_dataset, full_dataset, mean_intensity = initMasksGroups(mask_fid, 
+        mask_dataset, full_dataset, mean_intensity = initMasksGroups(mask_fid,
             expected_frames, vid.height, vid.width,
             attr_params, save_full_interval)
-        
+
         if is_bgnd_subtraction:
             bg_dataset = createImgGroup(mask_fid, "/bgnd", 1, vid.height, vid.width, is_expandable=False)
             # because we only save the one background:
-            bg_dataset._v_attrs['save_interval'] = vid.frame_max-vid.first_frame + 1 
+            bg_dataset._v_attrs['save_interval'] = vid.frame_max-vid.first_frame + 1
             bg_dataset[0,:,:] = img_fov
-            
+
         if vid.dtype != np.uint8:
             # this will worm as flags to be sure that the normalization took place.
-            normalization_range = mask_fid.create_earray('/', 
+            normalization_range = mask_fid.create_earray('/',
                                         'normalization_range',
                                         atom=tables.Float32Atom(),
                                         shape=(0, 2),
                                         expectedrows=expected_frames,
                                         filters=TABLE_FILTERS
                                         )
-    
+
         while frame_number < max_frame:
 
             ret, image = vid.read()
@@ -396,23 +405,23 @@ def compressVideo(video_file, masked_image_file, mask_param,  expected_fps=25,
                 Ibuff = Ibuff[:ind_buff + 1]
 
             # mask buffer and save data into the hdf5 file
-            if (ind_buff == buffer_size - 1 or ret == 0) and Ibuff.size > 0:                
+            if (ind_buff == buffer_size - 1 or ret == 0) and Ibuff.size > 0:
                 if is_bgnd_subtraction:
                     Ibuff_b  = bgnd_subtractor.apply(Ibuff, frame_number)
                 else:
                     Ibuff_b = Ibuff
-                
+
                 #calculate the max/min in the of the buffer
                 img_reduce = reduceBuffer(Ibuff_b, mask_param['is_light_background'])
 
-                mask = getROIMask(img_reduce, **mask_param)
-                
+                mask = getROIMask(img_reduce, wells_mask=wells_mask, **mask_param)
+
                 Ibuff *= mask
 
                 # now apply the well_mask if is MWP
                 if is_fov_tosplit:
                     fovsplitter.apply_wells_mask(Ibuff) # Ibuff will be modified after this
-                    
+
                 # add buffer to the hdf5 file
                 frame_first_buff = frame_number - Ibuff.shape[0]
                 mask_dataset.append(Ibuff)
@@ -421,20 +430,17 @@ def compressVideo(video_file, masked_image_file, mask_param,  expected_fps=25,
                 # calculate the progress and put it in a string
                 progress_str = progressTime.get_str(frame_number)
                 print_flush(base_name + ' ' + progress_str)
-                
+
             # finish process
             if ret == 0:
                 break
 
         # close the video
         vid.release()
-        
+
     # save fovsplitting data
     if is_fov_tosplit:
         fovsplitter.write_fov_wells_to_file(masked_image_file)
 
     read_and_save_timestamp(masked_image_file)
     print_flush(base_name + ' Compressed video done.')
-    
-
-
